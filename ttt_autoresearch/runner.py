@@ -117,6 +117,7 @@ class AutoResearchRunner:
         candidate: PatchCandidate,
         step: int,
         state_id: str,
+        gpu_device: str | None = None,
     ) -> RunResult:
         workspace = self.run_dir / "candidates" / f"{step:04d}_{uuid.uuid4().hex[:8]}"
         self._copy_repo(workspace)
@@ -127,6 +128,7 @@ class AutoResearchRunner:
             bootstrap=bootstrap,
             label=f"candidate-{step:04d}",
             state_id=state_id,
+            gpu_device=gpu_device,
         )
         return result
 
@@ -187,9 +189,12 @@ class AutoResearchRunner:
         bootstrap: BootstrapContext | None,
         label: str,
         state_id: str | None = None,
+        gpu_device: str | None = None,
     ) -> RunResult:
         command = self._resolve_command(command_template, workspace, bootstrap, label, state_id)
         env = bootstrap.subprocess_env() if bootstrap else dict(os.environ)
+        if gpu_device is not None:
+            env["CUDA_VISIBLE_DEVICES"] = gpu_device
         stdout_path = workspace / "stdout.log"
         stderr_path = workspace / "stderr.log"
         metrics_path = workspace / "metrics.json"

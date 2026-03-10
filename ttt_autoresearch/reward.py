@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import queue
 import threading
 from typing import Any
 
@@ -11,6 +12,7 @@ from ttt_autoresearch.runner import AutoResearchRunner, PatchCandidate, RunResul
 
 _ARTIFACT_LOCK = threading.Lock()
 _EVALUATION_SLOTS: threading.BoundedSemaphore | None = None
+_GPU_DEVICE_QUEUE: queue.Queue[str] | None = None
 
 
 def reward_for_result(current_best_val_bpb: float, result: RunResult) -> tuple[float, float]:
@@ -31,10 +33,25 @@ class AutoResearchRewardEvaluator(BaseRewardEvaluator):
 
     @classmethod
     def configure(cls, bootstrap: BootstrapContext, runner: AutoResearchRunner) -> None:
-        global _EVALUATION_SLOTS
+        global _EVALUATION_SLOTS, _GPU_DEVICE_QUEUE
         cls.bootstrap = bootstrap
         cls.runner = runner
         _EVALUATION_SLOTS = threading.BoundedSemaphore(bootstrap.config.max_concurrent_evaluations)
+        _GPU_DEVICE_QUEUE = None
+        gpu_devices = bootstrap.config.gpu_devices or []
+        if bootstrap.config.max_concurrent_evaluations > 1:
+            if not gpu_devices:
+                raise ValueError(
+                    "max_concurrent_evaluations > 1 requires gpu_devices to be set so candidate runs can be pinned to distinct GPUs."
+                )
+            if bootstrap.config.max_concurrent_evaluations > len(gpu_devices):
+                raise ValueError(
+                    "max_concurrent_evaluations cannot exceed the number of configured gpu_devices."
+                )
+        if gpu_devices:
+            _GPU_DEVICE_QUEUE = queue.Queue()
+            for gpu_device in gpu_devices:
+                _GPU_DEVICE_QUEUE.put(gpu_device)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.problem_type = kwargs.get("problem_type", "autoresearch")
@@ -117,14 +134,20 @@ class AutoResearchRewardEvaluator(BaseRewardEvaluator):
         # Grouped rollouts stay enabled for the upstream entropic advantage recipe,
         # but inner autoresearch training runs must be serialized on a single GPU.
         _EVALUATION_SLOTS.acquire()
+        gpu_device: str | None = None
         try:
+            if _GPU_DEVICE_QUEUE is not None:
+                gpu_device = _GPU_DEVICE_QUEUE.get()
             return self.runner.run_candidate(
                 bootstrap=self.bootstrap,
                 candidate=candidate,
                 step=getattr(state, "timestep", -1) + 1,
                 state_id=getattr(state, "id", "unknown"),
+                gpu_device=gpu_device,
             )
         finally:
+            if _GPU_DEVICE_QUEUE is not None and gpu_device is not None:
+                _GPU_DEVICE_QUEUE.put(gpu_device)
             _EVALUATION_SLOTS.release()
 
     @staticmethod

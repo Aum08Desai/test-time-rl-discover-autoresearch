@@ -86,6 +86,7 @@ class CliIntegrationTests(unittest.TestCase):
                             "model_name: Qwen/Qwen3.5-35B-A3B",
                             f"run_dir: {run_dir}",
                             "max_steps: 3",
+                            "groups_per_step: 3",
                             "samples_per_step: 2",
                             "baseline_command_override:",
                             f"  - {sys.executable}",
@@ -110,6 +111,7 @@ class CliIntegrationTests(unittest.TestCase):
                 self.assertTrue(captured.get("dataset_builder_called"))
                 self.assertEqual(captured["rl_config"]["model_name"], "Qwen/Qwen3.5-35B-A3B")
                 self.assertEqual(captured["rl_config"]["num_epochs"], 3)
+                self.assertEqual(captured["dataset_config"]["batch_size"], 3)
                 self.assertEqual(captured["dataset_config"]["group_size"], 2)
                 self.assertEqual(captured["dataset_config"]["problem_type"], "autoresearch")
         finally:

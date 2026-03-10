@@ -25,7 +25,8 @@ class TTTAutoResearchConfig:
     model_name: str = "Qwen/Qwen3.5-35B-A3B"
     provider: str | None = None
     api_base: str | None = None
-    max_steps: int = 8
+    max_steps: int = 50
+    groups_per_step: int = 8
     samples_per_step: int = 8
     temperature: float = 1.0
     timeout_sec: int = 2700
@@ -46,6 +47,7 @@ class TTTAutoResearchConfig:
     local_model_path: str | None = None
     keep_history: int = 6
     max_concurrent_evaluations: int = 1
+    gpu_devices: list[str] | None = None
 
     def normalized(self, repo_root: Path) -> "TTTAutoResearchConfig":
         run_dir = _resolve_path(self.run_dir, repo_root) if self.run_dir else repo_root / "runs" / datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -55,6 +57,7 @@ class TTTAutoResearchConfig:
             provider=self.provider,
             api_base=self.api_base,
             max_steps=self.max_steps,
+            groups_per_step=max(1, int(self.groups_per_step)),
             samples_per_step=self.samples_per_step,
             temperature=self.temperature,
             timeout_sec=self.timeout_sec,
@@ -75,6 +78,7 @@ class TTTAutoResearchConfig:
             local_model_path=_resolve_optional_path_str(self.local_model_path, repo_root),
             keep_history=self.keep_history,
             max_concurrent_evaluations=max(1, int(self.max_concurrent_evaluations)),
+            gpu_devices=_normalize_string_list(self.gpu_devices),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -163,6 +167,12 @@ def _normalize_command(command: list[str] | str | None) -> list[str] | None:
     if isinstance(command, str):
         return shlex.split(command)
     return [str(part) for part in command]
+
+
+def _normalize_string_list(values: list[str] | list[int] | tuple[str, ...] | tuple[int, ...] | None) -> list[str] | None:
+    if values is None:
+        return None
+    return [str(value) for value in values]
 
 
 def _resolve_path(path_value: str | os.PathLike[str], repo_root: Path) -> Path:

@@ -92,6 +92,17 @@ class RunnerTests(unittest.TestCase):
             ).normalized(root)
             self.assertEqual(config.renderer_name, "gpt_oss_high_reasoning")
 
+    def test_group_defaults_reflect_paper_shaped_config(self) -> None:
+        config = TTTAutoResearchConfig().normalized(Path("."))
+        self.assertEqual(config.max_steps, 50)
+        self.assertEqual(config.groups_per_step, 8)
+        self.assertEqual(config.samples_per_step, 8)
+        self.assertEqual(config.max_concurrent_evaluations, 1)
+
+    def test_gpu_devices_are_normalized(self) -> None:
+        config = TTTAutoResearchConfig(gpu_devices=[0, 3, 7]).normalized(Path("."))
+        self.assertEqual(config.gpu_devices, ["0", "3", "7"])
+
 
 if __name__ == "__main__":
     unittest.main()

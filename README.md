@@ -66,14 +66,16 @@ Important details:
 - The **action** is the full replacement contents of `train.py`.
 - The **reward** is the inner-loop metric outcome, not the patch text.
 - The implementation keeps grouped rollouts for the upstream entropic advantage recipe.
-- Inner evaluations are serialized by default with `max_concurrent_evaluations: 1` so multiple full training jobs do not fight over the same GPU.
+- The default config is now paper-shaped: `8 groups x 8 rollouts x 50 steps`.
+- In this repo, groups are controlled by `groups_per_step` and rollouts within each group are controlled by `samples_per_step`.
+- The checked-in default keeps `max_concurrent_evaluations: 1` for safety; to scale on rented hardware, you raise concurrency and declare explicit `gpu_devices`.
 
 ## Quick Start
 
 **Requirements**
 
 - Linux
-- A single NVIDIA GPU
+- NVIDIA GPUs
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/)
 
@@ -103,12 +105,161 @@ The default config lives at [configs/ttt_discover_autoresearch.yaml](configs/ttt
 Current defaults:
 
 - `model_name: Qwen/Qwen3.5-35B-A3B`
+- `groups_per_step: 8`
 - `samples_per_step: 8`
-- `max_steps: 8`
+- `max_steps: 50`
 - `temperature: 1.0`
 - `max_concurrent_evaluations: 1`
 
-That means the RL loop samples grouped candidates for the upstream TTT recipe, but only one full inner autoresearch training run executes at a time on the local machine.
+That means the default run is:
+
+- `8 groups`
+- `8 rollouts per group`
+- `64 total inner evaluations per step`
+- `50 outer RL steps`
+- but only `1` inner evaluation runs at a time unless you explicitly provision more GPUs
+
+This keeps the paper-shaped RL structure while remaining safe to launch on limited hardware.
+
+## Recommended Hardware
+
+If your goal is to match the spirit of the original autoresearch setup and push toward the best `val_bpb`, the inner loop should run on **H100 80GB** class GPUs.
+
+Why:
+
+- [train.py](/Users/aumdesai/AutoResearch-Discover/train.py) uses Hopper-specific FA3 kernels when available.
+- [program.md](/Users/aumdesai/AutoResearch-Discover/program.md) shows representative peak VRAM around `45 GB`.
+- `A100 40GB` is therefore not sufficient.
+
+Recommended inner-loop rental target:
+
+- **Best cost/performance:** H100 PCIe 80GB
+- **Best absolute performance:** H100 SXM 80GB
+
+For the paper-shaped default config, the natural operational target is:
+
+- **64 H100 80GB GPUs** for inner evaluations
+- one rollout per GPU
+- one full outer step in roughly one inner-training wave
+
+If you have fewer GPUs, the run still works, but each outer step takes multiple waves.
+To use more than one GPU safely, you should set:
+
+```yaml
+max_concurrent_evaluations: 64
+gpu_devices: ["0", "1", "2", "3", "..."]
+```
+
+The runner now pins each candidate subprocess to one configured `CUDA_VISIBLE_DEVICES` slot.
+
+## Cost Model
+
+There are two separate cost buckets:
+
+1. **Inner-loop GPU rental**
+   - pays for the actual `train.py` runs
+   - this dominates total cost in this repo
+
+2. **Outer-loop Tinker cost**
+   - pays for model prefill, sampling, and RL training tokens
+   - this is comparatively small here because the inner rollouts are expensive
+
+### Tinker Cost
+
+Using the official Tinker pricing for `Qwen/Qwen3.5-35B-A3B`:
+
+- prefill: `$0.36 / 1M tokens`
+- sample: `$0.89 / 1M tokens`
+- train: `$1.07 / 1M tokens`
+
+And using this repo's actual prompt/output sizes, a practical estimate is:
+
+- about **`$0.017-$0.024` per rollout**
+- about **`$0.020` per rollout** as a reasonable midpoint
+
+So for the default paper-shaped config:
+
+- `8 x 8 x 50 = 3200 total rollouts`
+- estimated Tinker cost: about **`$54-$77`**
+- midpoint estimate: about **`$65`**
+
+### GPU Rental Cost
+
+Using H100 PCIe 80GB pricing of roughly **`$2.86 / GPU / hour`**, and assuming one inner rollout takes roughly `325.9s` end to end:
+
+- each rollout costs about **`$0.259`** in GPU rental
+- `3200` rollouts costs about **`$829`** in GPU rental
+
+That means a fully provisioned `8 x 8 x 50` run is roughly:
+
+- **GPU rental:** about `$829`
+- **Tinker:** about `$65`
+- **Total:** about **`$894`**
+
+This is directionally consistent with the TTT-Discover paper's statement that runs cost a few hundred dollars to several hundred dollars per problem, with this repo skewing more expensive on the inner loop because each rollout is a real GPU training job.
+
+### Cost Distribution
+
+For this repo, the cost split is roughly:
+
+- **~90% GPU rental**
+- **~10% Tinker**
+
+That is the opposite of many lightweight code-generation settings. Here, the expensive part is the real autoresearch evaluation.
+
+## How I Recommend Running It
+
+### If you want the paper-shaped run
+
+Use the paper-shaped structure and rent:
+
+- **64x H100 PCIe 80GB**
+
+Set:
+
+```yaml
+groups_per_step: 8
+samples_per_step: 8
+max_steps: 50
+max_concurrent_evaluations: 64
+gpu_devices: ["0", "1", "2", ..., "63"]
+```
+
+This gives:
+
+- `8 groups x 8 rollouts`
+- one GPU per rollout
+- about one rollout wave per step
+- wall-clock of roughly `50 x 5.4 minutes`, plus overhead
+
+This is the closest clean operational match to the repo default.
+
+### If you want a cheaper but still strong run
+
+Use:
+
+- `groups_per_step: 8`
+- `samples_per_step: 8`
+- `max_steps: 8` to `16`
+- `max_concurrent_evaluations` equal to however many GPUs you actually rented
+
+This preserves the paper-like group structure while cutting total spend materially.
+
+### If you only have one GPU
+
+The checked-in config is already safe in the sense that it runs with one evaluation slot, but it will be extremely slow at full `8 x 8 x 50`.
+
+Instead reduce to something like:
+
+```yaml
+groups_per_step: 1
+samples_per_step: 8
+max_steps: 8
+max_concurrent_evaluations: 1
+gpu_devices: null
+```
+
+That is much slower and less faithful to the paper, but operationally sane on one machine.
 
 ## Model and Renderer Configuration
 
@@ -158,7 +309,7 @@ Each run writes artifacts under `runs/<timestamp>/`:
 
 ## Inner Loop Assumptions
 
-This repo intentionally keeps the inner autoresearch setup small:
+This repo intentionally keeps the inner autoresearch target small even though the outer RL setup can be large:
 
 - `prepare.py` remains fixed.
 - `train.py` is the only file the outer model edits.
@@ -175,9 +326,9 @@ Because that matches the original autoresearch framing and keeps the action spac
 
 Because upstream `discover` uses grouped rollouts for its entropic advantage estimation and reuse behavior. This repo keeps that outer-loop recipe.
 
-### Why serialize inner evaluations?
+### Why allow large concurrent inner evaluation now?
 
-Because unlike some upstream `discover` tasks, each rollout here is an actual GPU training job. Running several `train.py` jobs concurrently on one GPU would distort the reward surface and often fail operationally.
+Because the default configuration is no longer targeting a single local GPU. It is targeting rented multi-GPU execution where one rollout can be assigned to one GPU, which restores fair rollout timing and keeps the paper-like grouped rollout structure.
 
 ## Plain AutoResearch Mode Still Works
 
@@ -199,7 +350,7 @@ What is tested locally:
 - candidate parsing
 - environment prompt and state flow
 - CLI wiring into upstream `discover`
-- serialization of inner evaluations
+- concurrency gating for inner evaluations
 
 What is still environment-dependent:
 

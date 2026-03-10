@@ -149,6 +149,18 @@ class RewardTests(unittest.TestCase):
 
         self.assertEqual(runner.max_seen, 1)
 
+    def test_parallel_evaluations_require_explicit_gpu_devices(self) -> None:
+        bootstrap = BootstrapContext(
+            repo_root=Path("."),
+            run_dir=Path("."),
+            config=TTTAutoResearchConfig(max_concurrent_evaluations=2).normalized(Path(".")),
+            program_text="program",
+            baseline_train_py="train",
+            baseline_val_bpb=1.0,
+        )
+        with self.assertRaises(ValueError):
+            AutoResearchRewardEvaluator.configure(bootstrap, object())  # type: ignore[arg-type]
+
 
 if __name__ == "__main__":
     unittest.main()
