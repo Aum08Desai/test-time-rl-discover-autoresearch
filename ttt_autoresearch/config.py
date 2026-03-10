@@ -18,7 +18,7 @@ class TTTAutoResearchConfig:
     provider: str | None = None
     api_base: str | None = None
     max_steps: int = 8
-    samples_per_step: int = 4
+    samples_per_step: int = 8
     temperature: float = 1.0
     timeout_sec: int = 2700
     run_dir: str | None = None
