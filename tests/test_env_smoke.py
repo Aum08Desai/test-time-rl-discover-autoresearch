@@ -7,12 +7,28 @@ import unittest
 import sys
 
 from ttt_autoresearch.config import TTTAutoResearchConfig
-from ttt_autoresearch.env import AutoResearchDiscoverEnv
+from ttt_autoresearch.env import AutoResearchDiscoverEnv, AutoResearchState
 from ttt_autoresearch.reward import AutoResearchRewardEvaluator
 from ttt_autoresearch.runner import AutoResearchRunner
 
 
 class EnvSmokeTests(unittest.TestCase):
+    def test_state_prompt_shows_before_after_without_construction(self) -> None:
+        state = AutoResearchState(
+            timestep=1,
+            construction=[],
+            code="print('candidate')\n",
+            value=-0.9,
+            parent_values=[-1.1],
+            observation="val_bpb: 0.900000\n",
+            baseline_val_bpb=1.1,
+            current_best_val_bpb=0.9,
+            raw_score=0.9,
+        )
+        prompt = state.to_prompt(0.85, metric_name="val_bpb", maximize=False, language="python")
+        self.assertIn("Here is the val_bpb before and after running the code above", prompt)
+        self.assertIn("1.100000 -> 0.900000", prompt)
+
     def test_env_prompt_and_reward_flow(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -25,7 +41,10 @@ class EnvSmokeTests(unittest.TestCase):
             (fixtures / "fake_train.py").write_text(fixture_src.read_text(encoding="utf-8"), encoding="utf-8")
 
             config = TTTAutoResearchConfig(
+                execution_backend="local",
+                max_concurrent_evaluations=1,
                 timeout_sec=1,
+                target_val_bpb=0.95,
                 candidate_command_override=[sys.executable, "tests/fixtures/fake_train.py"],
             ).normalized(root)
             runner = AutoResearchRunner(root, config, Path(config.run_dir))
@@ -42,7 +61,21 @@ class EnvSmokeTests(unittest.TestCase):
             })())
 
             prompt = env.get_question()
-            self.assertIn("Current best val_bpb: 1.100000", prompt)
+            self.assertIn("You are iteratively optimizing val_bpb.", prompt)
+            self.assertIn("Current val_bpb (lower is better): 1.100000", prompt)
+            self.assertIn("Target: 0.95", prompt)
+            self.assertIn("Here is the last code we ran", prompt)
+            self.assertIn("## Problem", prompt)
+            self.assertIn("## Budget & Resources", prompt)
+            self.assertIn("## Rules", prompt)
+            self.assertIn("You may want to start your search from the current training script shown above.", prompt)
+            self.assertIn("This is the current starting point selected by the search procedure.", prompt)
+            self.assertIn("Reason about how you could further improve this training script under the fixed 5-minute training budget.", prompt)
+            self.assertIn("Moderate increases in VRAM are acceptable if they lead to meaningful gains.", prompt)
+            self.assertNotIn("Baseline val_bpb from the original script", prompt)
+            self.assertNotIn("LOOP FOREVER", prompt)
+            self.assertNotIn("results.tsv", prompt)
+            self.assertNotIn("git reset", prompt)
             self.assertTrue(env.check_format('{"summary":"s","rationale":"r","train_py":"# val_bpb: 0.900000\\n"}'))
 
             verify = asyncio.run(env.check_answer('{"summary":"s","rationale":"r","train_py":"# val_bpb: 0.900000\\n"}', 0))

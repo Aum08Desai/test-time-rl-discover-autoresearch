@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import tempfile
 import threading
 import time
@@ -26,8 +27,23 @@ class RewardTests(unittest.TestCase):
             command=["python", "train.py"],
             returncode=0,
         )
-        reward, correctness = reward_for_result(1.0, result)
-        self.assertAlmostEqual(reward, 0.1)
+        reward, correctness = reward_for_result(result)
+        self.assertAlmostEqual(reward, 1.0 / 0.9)
+        self.assertEqual(correctness, 1.0)
+
+        regression_result = RunResult(
+            status="success",
+            val_bpb=1.1,
+            stdout_path=Path("stdout.log"),
+            stderr_path=Path("stderr.log"),
+            elapsed_sec=1.0,
+            workspace_path=Path("."),
+            metrics_path=None,
+            command=["python", "train.py"],
+            returncode=0,
+        )
+        reward, correctness = reward_for_result(regression_result)
+        self.assertAlmostEqual(reward, 1.0 / 1.1)
         self.assertEqual(correctness, 1.0)
 
         timeout_result = RunResult(
@@ -41,8 +57,8 @@ class RewardTests(unittest.TestCase):
             command=["python", "train.py"],
             returncode=None,
         )
-        reward, correctness = reward_for_result(1.0, timeout_result)
-        self.assertEqual(reward, -0.5)
+        reward, correctness = reward_for_result(timeout_result)
+        self.assertEqual(reward, 0.0)
         self.assertEqual(correctness, 0.0)
 
     def test_evaluator_uses_inner_metric_as_reward(self) -> None:
@@ -57,6 +73,8 @@ class RewardTests(unittest.TestCase):
             (fixtures / "fake_train.py").write_text(fixture_src.read_text(encoding="utf-8"), encoding="utf-8")
 
             config = TTTAutoResearchConfig(
+                execution_backend="local",
+                max_concurrent_evaluations=1,
                 timeout_sec=1,
                 baseline_command_override=[sys.executable, "tests/fixtures/fake_train.py"],
                 candidate_command_override=[sys.executable, "tests/fixtures/fake_train.py"],
@@ -77,6 +95,48 @@ class RewardTests(unittest.TestCase):
             result = evaluator.get_reward(payload, state)
             self.assertGreater(result["reward"], 0.0)
             self.assertEqual(result["correctness"], 1.0)
+            manifest = json.loads((Path(config.run_dir) / "candidates").glob("*/rollout_manifest.json").__next__().read_text(encoding="utf-8"))
+            self.assertEqual(manifest["starting_state"]["timestep"], -1)
+            self.assertEqual(manifest["candidate"]["summary"], "improve")
+            self.assertEqual(manifest["evaluation"]["status"], "success")
+
+    def test_invalid_candidate_is_persisted_to_history_and_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "program.md").write_text("program", encoding="utf-8")
+            (root / "prepare.py").write_text("TIME_BUDGET = 1\n", encoding="utf-8")
+            (root / "train.py").write_text("# val_bpb: 1.000000\n", encoding="utf-8")
+
+            config = TTTAutoResearchConfig(
+                execution_backend="local",
+                max_concurrent_evaluations=1,
+                timeout_sec=1,
+            ).normalized(root)
+            runner = AutoResearchRunner(root, config, Path(config.run_dir))
+            bootstrap = runner.build_bootstrap(1.0)
+            AutoResearchRewardEvaluator.configure(bootstrap, runner)
+            evaluator = AutoResearchRewardEvaluator(problem_type="autoresearch", log_dir=str(bootstrap.run_dir))
+            state = AutoResearchState(
+                timestep=2,
+                construction=[],
+                code=(root / "train.py").read_text(encoding="utf-8"),
+                value=-1.0,
+                baseline_val_bpb=1.0,
+                current_best_val_bpb=1.0,
+            )
+
+            result = evaluator.get_reward("not-json", state)
+
+            self.assertEqual(result["metrics"]["candidate_status"], "invalid_candidate")
+            history_path = Path(config.run_dir) / "history.jsonl"
+            history_entries = history_path.read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(history_entries), 1)
+            history = json.loads(history_entries[0])
+            self.assertEqual(history["status"], "invalid_candidate")
+            manifest_path = next((Path(config.run_dir) / "candidates").glob("*/rollout_manifest.json"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["evaluation"]["status"], "invalid_candidate")
+            self.assertEqual(manifest["raw_response"], "not-json")
 
     def test_concurrent_reward_calls_serialize_inner_evaluations(self) -> None:
         class FakeRunner:
@@ -112,13 +172,16 @@ class RewardTests(unittest.TestCase):
             def append_history(self, _: dict[str, object]) -> None:
                 return None
 
+            def write_rollout_manifest(self, workspace: Path, payload: dict[str, object]) -> Path:
+                return workspace / "rollout_manifest.json"
+
             def read_text(self, _: Path, max_chars: int = 4000) -> str:
                 return ""
 
         bootstrap = BootstrapContext(
             repo_root=Path("."),
             run_dir=Path("."),
-            config=TTTAutoResearchConfig(max_concurrent_evaluations=1).normalized(Path(".")),
+            config=TTTAutoResearchConfig(execution_backend="local", max_concurrent_evaluations=1).normalized(Path(".")),
             program_text="program",
             baseline_train_py="train",
             baseline_val_bpb=1.0,
@@ -153,7 +216,7 @@ class RewardTests(unittest.TestCase):
         bootstrap = BootstrapContext(
             repo_root=Path("."),
             run_dir=Path("."),
-            config=TTTAutoResearchConfig(max_concurrent_evaluations=2).normalized(Path(".")),
+            config=TTTAutoResearchConfig(execution_backend="local", max_concurrent_evaluations=2).normalized(Path(".")),
             program_text="program",
             baseline_train_py="train",
             baseline_val_bpb=1.0,

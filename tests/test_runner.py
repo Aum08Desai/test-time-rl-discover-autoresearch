@@ -31,6 +31,7 @@ class RunnerTests(unittest.TestCase):
             (fixtures / "fake_train.py").write_text(fixture_src.read_text(encoding="utf-8"), encoding="utf-8")
 
             config = TTTAutoResearchConfig(
+                execution_backend="local",
                 timeout_sec=1,
                 baseline_command_override=[sys.executable, "tests/fixtures/fake_train.py"],
             ).normalized(root)
@@ -39,6 +40,21 @@ class RunnerTests(unittest.TestCase):
             result = runner.run_baseline(bootstrap=bootstrap)
             self.assertEqual(result.status, "success")
             self.assertAlmostEqual(result.val_bpb, 1.25)
+            self.assertTrue((Path(config.run_dir) / "baseline" / "train.py").exists())
+
+    def test_build_bootstrap_prefers_stored_baseline_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run_dir = root / "resume-run"
+            (root / "program.md").write_text("program", encoding="utf-8")
+            (root / "train.py").write_text("repo version\n", encoding="utf-8")
+            (run_dir / "baseline").mkdir(parents=True)
+            (run_dir / "baseline" / "train.py").write_text("stored baseline\n", encoding="utf-8")
+
+            config = TTTAutoResearchConfig(run_dir=str(run_dir)).normalized(root)
+            runner = AutoResearchRunner(root, config, Path(config.run_dir))
+            bootstrap = runner.build_bootstrap(1.0)
+            self.assertEqual(bootstrap.baseline_train_py, "stored baseline\n")
 
     def test_config_normalizes_relative_paths_and_overrides_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -94,10 +110,14 @@ class RunnerTests(unittest.TestCase):
 
     def test_group_defaults_reflect_medium_preset(self) -> None:
         config = TTTAutoResearchConfig().normalized(Path("."))
+        self.assertEqual(config.model_name, "openai/gpt-oss-120b")
+        self.assertEqual(config.execution_backend, "runpod")
         self.assertEqual(config.max_steps, 12)
         self.assertEqual(config.groups_per_step, 2)
         self.assertEqual(config.samples_per_step, 8)
-        self.assertEqual(config.max_concurrent_evaluations, 1)
+        self.assertEqual(config.max_concurrent_evaluations, 16)
+        self.assertEqual(config.renderer_name, "gpt_oss_high_reasoning")
+        self.assertEqual(config.runpod_gpu_type_ids, ["NVIDIA H100 PCIe"])
 
     def test_gpu_devices_are_normalized(self) -> None:
         config = TTTAutoResearchConfig(gpu_devices=[0, 3, 7]).normalized(Path("."))

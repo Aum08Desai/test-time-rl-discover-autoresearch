@@ -13,6 +13,7 @@ import uuid
 from typing import Any
 
 from ttt_autoresearch.config import BootstrapContext, TTTAutoResearchConfig
+from ttt_autoresearch.runpod import RunPodPool
 
 
 VAL_BPB_RE = re.compile(r"^val_bpb:\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)", re.MULTILINE)
@@ -82,6 +83,7 @@ class AutoResearchRunner:
         self.repo_root = repo_root
         self.config = config
         self.run_dir = run_dir
+        self._runpod_pool: RunPodPool | None = None
         self.run_dir.mkdir(parents=True, exist_ok=True)
         (self.run_dir / "baseline").mkdir(exist_ok=True)
         (self.run_dir / "candidates").mkdir(exist_ok=True)
@@ -89,7 +91,7 @@ class AutoResearchRunner:
 
     def build_bootstrap(self, baseline_val_bpb: float) -> BootstrapContext:
         program_text = (self.repo_root / "program.md").read_text(encoding="utf-8")
-        baseline_train_py = (self.repo_root / "train.py").read_text(encoding="utf-8")
+        baseline_train_py = self._load_baseline_train_py()
         return BootstrapContext(
             repo_root=self.repo_root,
             run_dir=self.run_dir,
@@ -99,9 +101,33 @@ class AutoResearchRunner:
             baseline_val_bpb=baseline_val_bpb,
         )
 
+    def load_existing_baseline_result(self) -> RunResult | None:
+        baseline_path = self.run_dir / "baseline.json"
+        if not baseline_path.exists():
+            return None
+        try:
+            payload = json.loads(baseline_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return None
+        try:
+            return RunResult(
+                status=str(payload["status"]),
+                val_bpb=float(payload["val_bpb"]) if payload.get("val_bpb") is not None else None,
+                stdout_path=Path(payload["stdout_path"]),
+                stderr_path=Path(payload["stderr_path"]),
+                elapsed_sec=float(payload["elapsed_sec"]),
+                workspace_path=Path(payload["workspace_path"]),
+                metrics_path=Path(payload["metrics_path"]) if payload.get("metrics_path") else None,
+                command=[str(part) for part in payload.get("command", [])],
+                returncode=int(payload["returncode"]) if payload.get("returncode") is not None else None,
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
     def run_baseline(self, bootstrap: BootstrapContext | None = None) -> RunResult:
         workspace = self.run_dir / "baseline" / "workspace"
         self._copy_repo(workspace)
+        (self.run_dir / "baseline" / "train.py").write_text((workspace / "train.py").read_text(encoding="utf-8"), encoding="utf-8")
         result = self._execute_workspace(
             workspace=workspace,
             command_template=self.config.baseline_command_override,
@@ -131,6 +157,12 @@ class AutoResearchRunner:
             gpu_device=gpu_device,
         )
         return result
+
+    def create_candidate_artifact_dir(self, step: int, prefix: str = "candidate") -> Path:
+        label = prefix.replace(" ", "_")
+        workspace = self.run_dir / "candidates" / f"{step:04d}_{label}_{uuid.uuid4().hex[:8]}"
+        workspace.mkdir(parents=True, exist_ok=False)
+        return workspace
 
     def initialize_best_from_baseline(self, baseline_result: RunResult, train_py_text: str) -> None:
         if baseline_result.val_bpb is None:
@@ -173,6 +205,20 @@ class AutoResearchRunner:
         with history_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, sort_keys=True) + "\n")
 
+    def write_rollout_manifest(self, workspace: Path, payload: dict[str, Any]) -> Path:
+        path = workspace / "rollout_manifest.json"
+        self._write_json(path, payload)
+        return path
+
+    def write_json_artifact(self, path: Path, payload: dict[str, Any]) -> Path:
+        self._write_json(path, payload)
+        return path
+
+    def close(self) -> None:
+        if self._runpod_pool is not None:
+            self._runpod_pool.close()
+            self._runpod_pool = None
+
     def _copy_repo(self, workspace: Path) -> None:
         if workspace.exists():
             shutil.rmtree(workspace)
@@ -193,32 +239,51 @@ class AutoResearchRunner:
     ) -> RunResult:
         command = self._resolve_command(command_template, workspace, bootstrap, label, state_id)
         env = bootstrap.subprocess_env() if bootstrap else dict(os.environ)
-        if gpu_device is not None:
+        if gpu_device is not None and self.config.execution_backend == "local":
             env["CUDA_VISIBLE_DEVICES"] = gpu_device
         stdout_path = workspace / "stdout.log"
         stderr_path = workspace / "stderr.log"
         metrics_path = workspace / "metrics.json"
         start = time.time()
-        try:
-            proc = subprocess.run(
-                command,
-                cwd=workspace,
+        if self.config.execution_backend == "runpod":
+            pool = self._get_runpod_pool()
+            remote_result = pool.execute_workspace(
+                workspace=workspace,
+                command=command,
                 env=env,
-                timeout=self.config.timeout_sec,
-                text=True,
-                capture_output=True,
-                check=False,
+                timeout_sec=self.config.timeout_sec,
+                label=label,
             )
-            stdout = proc.stdout
-            stderr = proc.stderr
-            returncode = proc.returncode
-            status = "success" if returncode == 0 else "crash"
-        except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
-            returncode = None
-            status = "timeout"
-        elapsed_sec = time.time() - start
+            stdout = remote_result.stdout
+            stderr = remote_result.stderr
+            returncode = remote_result.returncode
+            elapsed_sec = remote_result.elapsed_sec
+            if returncode == 124:
+                status = "timeout"
+                returncode = None
+            else:
+                status = "success" if returncode == 0 else "crash"
+        else:
+            try:
+                proc = subprocess.run(
+                    command,
+                    cwd=workspace,
+                    env=env,
+                    timeout=self.config.timeout_sec,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                stdout = proc.stdout
+                stderr = proc.stderr
+                returncode = proc.returncode
+                status = "success" if returncode == 0 else "crash"
+            except subprocess.TimeoutExpired as exc:
+                stdout = exc.stdout or ""
+                stderr = exc.stderr or ""
+                returncode = None
+                status = "timeout"
+            elapsed_sec = time.time() - start
         stdout_path.write_text(stdout, encoding="utf-8")
         stderr_path.write_text(stderr, encoding="utf-8")
 
@@ -243,6 +308,11 @@ class AutoResearchRunner:
             command=command,
             returncode=returncode,
         )
+
+    def _get_runpod_pool(self) -> RunPodPool:
+        if self._runpod_pool is None:
+            self._runpod_pool = RunPodPool(repo_root=self.repo_root, run_dir=self.run_dir, config=self.config)
+        return self._runpod_pool
 
     def _read_val_bpb(self, stdout: str, metrics_path: Path) -> float | None:
         direct = parse_val_bpb(stdout)
@@ -291,3 +361,13 @@ class AutoResearchRunner:
     @staticmethod
     def _write_json(path: Path, payload: dict[str, Any]) -> None:
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def _load_baseline_train_py(self) -> str:
+        for candidate in (
+            self.run_dir / "baseline" / "train.py",
+            self.run_dir / "baseline" / "workspace" / "train.py",
+            self.repo_root / "train.py",
+        ):
+            if candidate.exists():
+                return candidate.read_text(encoding="utf-8")
+        raise FileNotFoundError("Could not locate baseline train.py in either the run directory or repo root.")

@@ -84,10 +84,12 @@ class CliIntegrationTests(unittest.TestCase):
                     "\n".join(
                         [
                             "model_name: Qwen/Qwen3.5-35B-A3B",
+                            "execution_backend: local",
                             f"run_dir: {run_dir}",
                             "max_steps: 3",
                             "groups_per_step: 3",
                             "samples_per_step: 2",
+                            "max_concurrent_evaluations: 1",
                             "baseline_command_override:",
                             f"  - {sys.executable}",
                             "  - -c",
@@ -111,9 +113,125 @@ class CliIntegrationTests(unittest.TestCase):
                 self.assertTrue(captured.get("dataset_builder_called"))
                 self.assertEqual(captured["rl_config"]["model_name"], "Qwen/Qwen3.5-35B-A3B")
                 self.assertEqual(captured["rl_config"]["num_epochs"], 3)
+                self.assertEqual(captured["rl_config"]["adv_estimator"], "entropic_adaptive_beta")
+                self.assertEqual(captured["rl_config"]["loss_fn"], "importance_sampling")
+                self.assertEqual(captured["rl_config"]["num_substeps"], 1)
+                self.assertTrue(captured["rl_config"]["remove_constant_reward_groups"])
                 self.assertEqual(captured["dataset_config"]["batch_size"], 3)
                 self.assertEqual(captured["dataset_config"]["group_size"], 2)
                 self.assertEqual(captured["dataset_config"]["problem_type"], "autoresearch")
+        finally:
+            for name, previous in previous_modules.items():
+                if previous is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = previous
+
+    def test_cli_reuses_existing_baseline_when_resuming(self) -> None:
+        captured: dict[str, object] = {}
+
+        fake_root = types.ModuleType("ttt_discover")
+        fake_rl = types.ModuleType("ttt_discover.rl")
+        fake_rl_train = types.ModuleType("ttt_discover.rl.train")
+        fake_utils = types.ModuleType("ttt_discover.tinker_utils")
+        fake_dataset_builder = types.ModuleType("ttt_discover.tinker_utils.dataset_builder")
+
+        class FakeRLConfig:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class FakeDatasetConfig:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+                captured["dataset_config"] = kwargs
+
+        def fake_get_single_problem_dataset_builder(config):
+            async def builder():
+                captured["dataset_builder_called"] = True
+                return {"dataset_config": config}
+
+            return builder
+
+        async def fake_discover_main(cfg):
+            captured["rl_config"] = cfg.__dict__.copy()
+            await cfg.dataset_builder()
+
+        fake_rl_train.Config = FakeRLConfig
+        fake_rl_train.main = fake_discover_main
+        fake_dataset_builder.DatasetConfig = FakeDatasetConfig
+        fake_dataset_builder.get_single_problem_dataset_builder = fake_get_single_problem_dataset_builder
+
+        previous_modules = {name: sys.modules.get(name) for name in (
+            "ttt_discover",
+            "ttt_discover.rl",
+            "ttt_discover.rl.train",
+            "ttt_discover.tinker_utils",
+            "ttt_discover.tinker_utils.dataset_builder",
+        )}
+        sys.modules["ttt_discover"] = fake_root
+        sys.modules["ttt_discover.rl"] = fake_rl
+        sys.modules["ttt_discover.rl.train"] = fake_rl_train
+        sys.modules["ttt_discover.tinker_utils"] = fake_utils
+        sys.modules["ttt_discover.tinker_utils.dataset_builder"] = fake_dataset_builder
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_path = Path(tmpdir)
+                run_dir = tmp_path / "runs" / "resume-test"
+                (run_dir / "baseline" / "workspace").mkdir(parents=True)
+                (run_dir / "baseline" / "workspace" / "train.py").write_text("# stored baseline\n", encoding="utf-8")
+                (run_dir / "baseline" / "train.py").write_text("# stored baseline\n", encoding="utf-8")
+                (run_dir / "best").mkdir(parents=True)
+                (run_dir / "baseline.json").write_text(
+                    "\n".join(
+                        [
+                            "{",
+                            '  "status": "success",',
+                            '  "val_bpb": 1.0,',
+                            f'  "stdout_path": "{run_dir / "baseline" / "workspace" / "stdout.log"}",',
+                            f'  "stderr_path": "{run_dir / "baseline" / "workspace" / "stderr.log"}",',
+                            '  "elapsed_sec": 1.0,',
+                            f'  "workspace_path": "{run_dir / "baseline" / "workspace"}",',
+                            '  "metrics_path": null,',
+                            '  "command": ["python", "train.py"],',
+                            '  "returncode": 0',
+                            "}",
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                config_path = tmp_path / "config.yaml"
+                config_path.write_text(
+                    "\n".join(
+                        [
+                            "model_name: Qwen/Qwen3.5-35B-A3B",
+                            "execution_backend: local",
+                            f"run_dir: {run_dir}",
+                            "max_steps: 3",
+                            "groups_per_step: 2",
+                            "samples_per_step: 2",
+                            "max_concurrent_evaluations: 1",
+                            "baseline_command_override:",
+                            f"  - {sys.executable}",
+                            "  - -c",
+                            '  - "import sys; sys.exit(7)"',
+                            "candidate_command_override:",
+                            f"  - {sys.executable}",
+                            "  - -c",
+                            '  - "print(\'val_bpb: 0.900000\')"',
+                            "wandb_project: null",
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                exit_code = cli.main(["--config", str(config_path)])
+                self.assertEqual(exit_code, 0)
+                self.assertTrue(captured.get("dataset_builder_called"))
+                self.assertEqual(captured["dataset_config"]["batch_size"], 2)
         finally:
             for name, previous in previous_modules.items():
                 if previous is None:

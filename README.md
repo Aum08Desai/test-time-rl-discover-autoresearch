@@ -4,13 +4,15 @@
 
 This repo is a focused fork of [karpathy/autoresearch](https://github.com/karpathy/autoresearch) that replaces the outer experiment loop with [TTT-Discover](https://github.com/test-time-training/discover).
 
-The setup is:
+The checked-in default is now a practical unattended setup:
 
-- The **inner loop** is still AutoResearch: edit [`train.py`](train.py), run a fixed-budget training job, and measure `val_bpb`.
-- The **outer loop** is TTT-Discover: the model proposes full replacements for `train.py`, sees the resulting metric, and is reinforced online from that reward.
-- The reward is strictly the inner-loop outcome: `current_best_val_bpb - candidate_val_bpb`.
+- **Outer loop:** Tinker + `openai/gpt-oss-120b`
+- **Renderer:** `gpt_oss_high_reasoning`
+- **Inner loop:** RunPod `H100 PCIe` spot workers
+- **Main preset:** `2 groups x 8 rollouts x 12 steps`
+- **Spot failover:** if a worker pod is preempted, the current rollout is retried on a replacement pod automatically
 
-This fork keeps the original AutoResearch target and uses TTT-Discover as the policy improvement layer.
+The core objective stays the same as the original AutoResearch repo: improve [`train.py`](train.py) to lower `val_bpb`.
 
 ## Credits
 
@@ -20,22 +22,247 @@ This project builds on:
 - [Learning to Discover at Test Time](https://arxiv.org/abs/2601.16175)
 - [test-time-training/discover](https://github.com/test-time-training/discover)
 
-The RL recipe stays with upstream `discover`. This repo provides the AutoResearch-specific environment, reward, runner, configs, and practical launch workflow.
+The RL recipe stays with upstream `discover`. This repo provides the AutoResearch-specific environment, reward, runner, RunPod execution backend, and practical launch workflow.
 
-## What This Repo Optimizes
+## How The System Works
 
-The repo has two layers:
+There are two loops:
 
-1. **Inner optimization target**
-   - [`prepare.py`](prepare.py) downloads data and trains the tokenizer.
+1. **Inner loop**
    - [`train.py`](train.py) is the only file the outer model edits.
-   - `val_bpb` is the optimization metric. Lower is better.
+   - Every rollout runs a real fixed-budget AutoResearch training job.
+   - The score is `val_bpb`, and lower is better.
 
-2. **Outer TTT-Discover loop**
-   - [`run_ttt_discover.py`](run_ttt_discover.py) launches the run.
-   - [`ttt_autoresearch/`](ttt_autoresearch/) adapts AutoResearch to the `discover` environment interface.
-   - Each candidate `train.py` is executed in an isolated workspace.
-   - Reward is computed from the measured improvement over the current best state.
+2. **Outer loop**
+   - TTT-Discover samples full-file replacements for `train.py`.
+   - Each candidate is evaluated by the inner loop.
+   - Reward is a direct transformed task score: `1 / (1e-8 + val_bpb)`.
+   - Failed or invalid candidates receive `0.0` reward.
+   - Upstream `discover` updates the outer model online.
+
+The checked-in workflow keeps the outer controller on a stable machine and uses RunPod spot instances only for the inner evaluations. That is what lets the run continue unattended if a spot worker disappears.
+
+## What “Unattended” Means Here
+
+This repo is designed so that:
+
+- the controller process running [`run_ttt_discover.py`](run_ttt_discover.py) stays alive on a stable machine
+- inner evaluations are dispatched to RunPod spot pods
+- if a pod is preempted during a rollout, the runner provisions a replacement pod
+- the interrupted rollout is retried from scratch on the replacement pod
+- the run continues until the configured `groups_per_step x samples_per_step x max_steps` budget is completed
+
+Important boundary:
+
+- the controller process itself is **not** spot-resilient
+- only the **inner worker pool** is spot-resilient
+
+So the outer process should run on your laptop, workstation, or another non-preemptible box. The H100 spot instances are only for the expensive inner `train.py` jobs.
+
+## Current Default
+
+The default config at [`configs/ttt_discover_autoresearch.yaml`](configs/ttt_discover_autoresearch.yaml) is the recommended medium run:
+
+- `model_name: openai/gpt-oss-120b`
+- `renderer_name: gpt_oss_high_reasoning`
+- `target_val_bpb: 0.85`
+- `execution_backend: runpod`
+- `groups_per_step: 2`
+- `samples_per_step: 8`
+- `max_steps: 12`
+- `max_concurrent_evaluations: 16`
+- `runpod_gpu_type_ids: ["NVIDIA H100 PCIe"]`
+- `runpod_interruptible: true`
+
+That means:
+
+- `16` rollouts per outer step
+- `12` outer RL updates
+- `192` rollout evaluations total
+- `1` extra baseline run before RL starts
+- `193` total inner jobs
+
+## Presets
+
+The repo ships with three practical presets:
+
+### Small
+
+File: [`configs/ttt_discover_autoresearch_small.yaml`](configs/ttt_discover_autoresearch_small.yaml)
+
+- `2 x 4 x 12`
+- `96` RL rollouts
+- `8` concurrent RunPod workers
+
+### Medium
+
+File: [`configs/ttt_discover_autoresearch_medium.yaml`](configs/ttt_discover_autoresearch_medium.yaml)
+
+- `2 x 8 x 12`
+- `192` RL rollouts
+- `16` concurrent RunPod workers
+
+This is the recommended main mode and matches the default config.
+
+### Large
+
+File: [`configs/ttt_discover_autoresearch_large.yaml`](configs/ttt_discover_autoresearch_large.yaml)
+
+- `2 x 8 x 20`
+- `320` RL rollouts
+- `16` concurrent RunPod workers
+
+Use this only after the medium run is stable.
+
+## RunPod Backend
+
+The inner-loop executor now supports two backends:
+
+- `local`
+- `runpod`
+
+The `runpod` backend does the following:
+
+1. Creates up to `max_concurrent_evaluations` spot pods.
+2. Waits for SSH on each pod.
+3. Bootstraps the pod by:
+   - uploading the repo snapshot
+   - installing `uv`
+   - running `uv sync`
+   - running `uv run prepare.py --num-shards 10`
+4. Uploads each candidate workspace to a worker pod.
+5. Runs the inner command remotely.
+6. Pulls back `stdout.log`, `stderr.log`, and metrics.
+7. Deletes the pods automatically when the run finishes.
+
+If a pod disappears during upload, bootstrap, or execution, the worker is retired, a replacement is created, and the interrupted rollout is retried.
+
+## Prerequisites
+
+You need:
+
+- Linux or macOS for the controller machine
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/)
+- a Tinker-enabled account for the outer loop
+- a RunPod account with:
+  - API access
+  - an SSH public key registered in the account
+  - access to H100 spot instances
+
+Environment:
+
+```bash
+export RUNPOD_API_KEY=...
+```
+
+You also need whatever Tinker credentials your local `ttt-discover` installation expects.
+
+## Quick Start
+
+Launch the default unattended medium run:
+
+```bash
+uv sync
+uv run python run_ttt_discover.py --config configs/ttt_discover_autoresearch.yaml
+```
+
+Or explicitly choose the medium preset:
+
+```bash
+uv run python run_ttt_discover.py --config configs/ttt_discover_autoresearch_medium.yaml
+```
+
+## Cost And Runtime Shape
+
+For this repo, the expensive part is the inner loop. Each rollout is a real five-minute AutoResearch training job.
+
+The repo’s own reference timing in [`program.md`](program.md) shows:
+
+- `total_seconds: 325.9` per rollout
+
+That means the default medium run has:
+
+- `192` RL rollouts
+- `1` baseline run
+- `193` total inner runs
+- about `17.47` total GPU-hours
+
+### Example Medium Budget
+
+Using your current spot numbers:
+
+- `H100 PCIe spot: $1.25/hr`
+- `H100 SXM spot: $1.75/hr`
+
+The medium run works out to:
+
+- `H100 PCIe`: about `$21.84`
+- `H100 SXM`: about `$30.57`
+
+Tinker is the smaller cost bucket here. The exact amount depends on current Tinker pricing and token usage, but for this repo it is materially smaller than the H100 rental line item.
+
+### Wall Clock
+
+Total GPU-hours are roughly fixed, so more pods mostly reduce elapsed time, not total spend.
+
+Approximate medium-run wall clock:
+
+- `1 H100`: about `18-20h`
+- `8 H100s`: about `2.5-3h`
+- `16 H100s`: about `1.3-1.8h`
+
+## Model And Renderer
+
+The checked-in default is:
+
+```yaml
+model_name: openai/gpt-oss-120b
+renderer_name: gpt_oss_high_reasoning
+```
+
+This is intentional:
+
+- it matches the strongest paper-aligned model family more closely than the older Qwen default
+- it is already supported by the renderer mapping in [`ttt_autoresearch/config.py`](ttt_autoresearch/config.py)
+- it is the intended outer-loop model for the default RunPod workflow
+
+Other models still work, but if the model family is not recognized automatically you must set `renderer_name` explicitly.
+
+## Important Config Knobs
+
+The main knobs for unattended RunPod execution are:
+
+- `execution_backend`
+  - use `runpod` for remote spot workers
+  - use `local` for direct local GPU execution
+- `max_concurrent_evaluations`
+  - number of worker pods for `runpod`
+  - number of local simultaneous inner runs for `local`
+- `runpod_gpu_type_ids`
+  - default is `["NVIDIA H100 PCIe"]`
+- `runpod_interruptible`
+  - leave this `true` for spot behavior
+- `runpod_bootstrap_commands`
+  - optional override if you want to use a custom image or template
+- `runpod_retry_limit`
+  - how many times to reprovision and retry an interrupted rollout before surfacing a failure
+
+## Fixed Prompt Target
+
+The checked-in presets use:
+
+```yaml
+target_val_bpb: 0.85
+```
+
+This is a prompt-side benchmark target, not a reward cap.
+
+- the model is shown the current starting state and the gap to `0.85`
+- the RL reward still comes from the actual achieved `val_bpb`
+- if a rollout beats `0.85`, it is still rewarded more for going even lower
+
+This mirrors how upstream `discover` environments use fixed benchmark targets in the prompt while computing reward from the evaluated task score.
 
 ## Repository Layout
 
@@ -44,244 +271,10 @@ prepare.py                  Fixed data prep and runtime utilities
 train.py                    Inner training program edited by the outer model
 program.md                  Human-authored research instructions/context
 run_ttt_discover.py         Main TTT-Discover entrypoint
-ttt_autoresearch/           Adapter layer for environment, reward, runner, config
+ttt_autoresearch/           Adapter layer for environment, reward, runner, RunPod, config
 configs/                    Practical preset YAML configs
 tests/                      Smoke and unit coverage for the adapter
 ```
-
-## How The RL Loop Works
-
-At each outer-loop step:
-
-1. TTT-Discover samples grouped candidate replacements for `train.py`.
-2. Each candidate is evaluated by running a real AutoResearch training job.
-3. The run logs are parsed for `val_bpb`.
-4. Reward is computed from improvement over the current best state.
-5. Upstream `discover` performs the online RL update.
-6. If a candidate improves `val_bpb`, it becomes the new best `train.py`.
-
-Important details:
-
-- The **action** is the full replacement contents of `train.py`.
-- The **reward** is the inner-loop metric outcome, not a heuristic about the patch text.
-- `groups_per_step` controls how many rollout groups are sampled at each RL step.
-- `samples_per_step` controls how many rollouts are sampled inside each group.
-- `max_concurrent_evaluations` controls how many expensive inner `train.py` jobs may run at once.
-
-## Quick Start
-
-**Requirements**
-
-- Linux
-- NVIDIA GPUs
-- Python 3.11+
-- [uv](https://docs.astral.sh/uv/)
-
-Install and prepare the base AutoResearch environment:
-
-```bash
-uv sync
-uv run prepare.py
-uv run train.py
-```
-
-Then launch the default practical TTT-Discover mode:
-
-```bash
-uv run python run_ttt_discover.py --config configs/ttt_discover_autoresearch.yaml
-```
-
-## Training Presets
-
-This repo now ships with three practical presets instead of a paper-scale default.
-
-### Small
-
-File: [`configs/ttt_discover_autoresearch_small.yaml`](configs/ttt_discover_autoresearch_small.yaml)
-
-- `groups_per_step: 2`
-- `samples_per_step: 4`
-- `max_steps: 12`
-- total evaluations: `96`
-
-Use this when:
-
-- you want a quick sanity run
-- you are testing a new model backend
-- you are on a single GPU and want something that finishes in a reasonable time
-
-### Medium
-
-File: [`configs/ttt_discover_autoresearch_medium.yaml`](configs/ttt_discover_autoresearch_medium.yaml)
-
-- `groups_per_step: 2`
-- `samples_per_step: 8`
-- `max_steps: 12`
-- total evaluations: `192`
-
-This is the **recommended main mode** for the repo.
-
-It is also the checked-in default at [`configs/ttt_discover_autoresearch.yaml`](configs/ttt_discover_autoresearch.yaml).
-
-### Large
-
-File: [`configs/ttt_discover_autoresearch_large.yaml`](configs/ttt_discover_autoresearch_large.yaml)
-
-- `groups_per_step: 2`
-- `samples_per_step: 8`
-- `max_steps: 20`
-- total evaluations: `320`
-
-Use this when the medium run is already stable and you want more policy updates without moving into paper-scale compute.
-
-## Recommended Modes
-
-For this fork, the most realistic settings are:
-
-- **Small:** `2 x 4 x 12`
-- **Medium:** `2 x 8 x 12`
-- **Large:** `2 x 8 x 20`
-
-These are intentionally sized around the practical AutoResearch regime, where each rollout is a real GPU training job. They keep grouped rollouts and online RL updates from TTT-Discover, but avoid the extreme compute profile of the original paper.
-
-## Hardware Recommendation
-
-If your goal is to push `val_bpb` seriously, the inner loop should run on **H100 80GB** class GPUs.
-
-Why:
-
-- [`train.py`](train.py) uses Hopper-specific FA3 kernels when available.
-- [`program.md`](program.md) shows representative peak VRAM around `45 GB`.
-- `A100 40GB` is therefore not viable for the intended setup.
-
-Recommended inner-loop target:
-
-- **Best cost/performance:** H100 PCIe 80GB
-- **Best absolute performance:** H100 SXM 80GB
-
-For these practical presets, I recommend:
-
-- **Small (`2x4x12`)**: rent `8x H100 80GB`
-- **Medium (`2x8x12`)**: rent `16x H100 80GB`
-- **Large (`2x8x20`)**: rent `16x H100 80GB`
-
-That gives one GPU per rollout in a step wave. If you rent fewer GPUs, the run still works, but each step is split into multiple waves and takes longer.
-
-To run with rented GPUs, set:
-
-```yaml
-max_concurrent_evaluations: 16
-gpu_devices: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15"]
-```
-
-The runner pins each candidate subprocess to one configured `CUDA_VISIBLE_DEVICES` slot.
-
-## Cost Model
-
-There are two cost buckets:
-
-1. **Inner-loop GPU rental**
-   - pays for the real `train.py` runs
-   - dominates total cost in this repo
-
-2. **Outer-loop Tinker cost**
-   - pays for prompt prefill, sampling, and RL training tokens
-   - is much smaller than the inner-loop GPU cost here
-
-### Cost Assumptions
-
-The estimates below use:
-
-- `Qwen/Qwen3.5-35B-A3B` on Tinker
-- H100 PCIe 80GB at about `$2.86 / GPU / hour`
-- about `325.9s` per inner rollout
-- about `$0.020` Tinker cost per rollout as a practical midpoint for this repo
-
-### Preset Cost Estimates
-
-| Mode | Shape | Total evals | GPU rental | Tinker | Total |
-|---|---:|---:|---:|---:|---:|
-| Small | `2x4x12` | 96 | about `$25` | about `$1.9` | about `$27` |
-| Medium | `2x8x12` | 192 | about `$50` | about `$3.8` | about `$54` |
-| Large | `2x8x20` | 320 | about `$83` | about `$6.4` | about `$89` |
-
-### Cost Distribution
-
-For these realistic runs, the cost split is still roughly:
-
-- **~92% GPU rental**
-- **~8% Tinker**
-
-That is the core difference between this repo and cheaper code-generation tasks: each rollout is a real training job.
-
-## How I Recommend Running It
-
-### Single GPU
-
-Use the small preset, and keep evaluation serialized:
-
-```yaml
-groups_per_step: 2
-samples_per_step: 4
-max_steps: 12
-max_concurrent_evaluations: 1
-gpu_devices: null
-```
-
-This is the safest way to stay close to the original one-GPU AutoResearch style while still using the TTT-Discover framework.
-
-### Practical Rented Run
-
-Use the medium preset:
-
-```bash
-uv run python run_ttt_discover.py --config configs/ttt_discover_autoresearch_medium.yaml
-```
-
-Recommended provisioning:
-
-- `16x H100 PCIe 80GB`
-- `max_concurrent_evaluations: 16`
-- `gpu_devices` set to the visible devices on the host
-
-This is the main mode I recommend if your goal is to beat the baseline without exploding compute.
-
-### Larger Budget Run
-
-Use the large preset:
-
-```bash
-uv run python run_ttt_discover.py --config configs/ttt_discover_autoresearch_large.yaml
-```
-
-This keeps the same grouped structure as medium, but increases the number of RL updates from `12` to `20`.
-
-## Model and Renderer Configuration
-
-The model is configurable, but the prompt and response format must match a supported renderer.
-
-Known-good renderer values:
-
-- `qwen3`
-- `qwen3_instruct`
-- `gpt_oss_no_sysprompt`
-- `gpt_oss_low_reasoning`
-- `gpt_oss_medium_reasoning`
-- `gpt_oss_high_reasoning`
-
-Examples:
-
-```yaml
-model_name: Qwen/Qwen3.5-35B-A3B
-renderer_name: qwen3
-```
-
-```yaml
-model_name: openai/gpt-oss-120b
-renderer_name: gpt_oss_high_reasoning
-```
-
-If you use an unknown model family, set `renderer_name` explicitly. The config fails fast if it cannot infer a compatible renderer.
 
 ## Output Artifacts
 
@@ -294,36 +287,104 @@ Each run writes artifacts under `runs/<timestamp>/`:
 - `best/metrics.json`
 - `candidates/`
 - `discover_log/`
+- `runpod_pool.json`
 
-## Plain AutoResearch Mode Still Works
+`runpod_pool.json` records the worker pod metadata for the current run so you can inspect what was provisioned.
 
-This fork does not remove the original AutoResearch workflow. You can still use it directly:
+The important resume/checkpoint files are:
 
-```bash
-uv run prepare.py
-uv run train.py
+- `baseline.json`
+  - cached baseline result; if it already exists, the CLI reuses it instead of rerunning baseline
+- `baseline/train.py`
+  - stored baseline script snapshot for reproducible resume
+- `best/train.py`
+  - best discovered script so far
+- `best/metrics.json`
+  - best discovered `val_bpb` plus artifact paths
+- `history.jsonl`
+  - append-only candidate evaluation log
+- `candidates/<step>_<id>/train.py`
+  - exact candidate script evaluated for that rollout
+- `candidates/<step>_<id>/stdout.log`
+  - raw stdout from the inner AutoResearch run
+- `candidates/<step>_<id>/stderr.log`
+  - raw stderr from the inner AutoResearch run
+- `candidates/<step>_<id>/metrics.json`
+  - parsed metrics sidecar for that rollout
+- `candidates/<step>_<id>/rollout_manifest.json`
+  - self-contained rollout record with the starting state, candidate payload, evaluation result, reward, and promotion outcome
+- invalid or malformed model outputs are also persisted under `candidates/` with a `rollout_manifest.json`, `metrics.json`, and raw `response.txt`
+- `discover_log/checkpoints.jsonl`
+  - upstream TTT-Discover checkpoint index
+- `discover_log/`
+  - LoRA/training state and sampler checkpoints used for resume
+
+## Resuming A Stopped Run
+
+To continue a stopped run, reuse the same `run_dir`.
+
+Example:
+
+```yaml
+run_dir: runs/my-main-run
 ```
 
-The TTT-Discover path is an additional outer loop, not a replacement for the inner codebase.
+Then rerun the same command:
+
+```bash
+uv run python run_ttt_discover.py --config configs/ttt_discover_autoresearch.yaml
+```
+
+Resume behavior:
+
+- the CLI reuses `baseline.json` and `baseline/train.py` if they already exist
+- upstream `discover` reloads the latest training checkpoint from `discover_log/checkpoints.jsonl`
+- upstream sampler state is reloaded from the matching sampler checkpoint step
+- every evaluated rollout remains on disk under `candidates/`, so prompt/response/result provenance is preserved even if the run is interrupted
+
+If you stopped at `12` steps and want to continue farther, increase `max_steps` above the completed count before rerunning.
+
+For example, to continue a finished medium run out to `20` steps:
+
+- keep the same `run_dir`
+- change `max_steps: 20`
+- rerun the command
+
+Important resume rule:
+
+- resume with the same code revision, model, renderer, rollout structure, and run directory whenever possible
+- changing those mid-run is not guaranteed to be meaningful or stable
+
+## Local Mode Still Exists
+
+If you want to run without RunPod, set:
+
+```yaml
+execution_backend: local
+```
+
+and configure `gpu_devices` if you want more than one local concurrent evaluation.
 
 ## Current Readiness
 
-What is tested locally:
+What is covered in tests:
 
-- config loading and override behavior
+- config loading and normalization
 - reward mapping
 - candidate parsing
-- environment prompt and state flow
 - CLI wiring into upstream `discover`
-- concurrency gating for inner evaluations
+- local concurrency gating
+- RunPod retry logic for interrupted workers
+- runner cleanup behavior
 
-What is still environment-dependent:
+What is still operationally environment-dependent:
 
-- a true end-to-end production run on the target Linux/CUDA machine
-- provider-specific model serving details
-- long-run throughput and stability on rented multi-GPU hardware
+- real RunPod API credentials
+- SSH access from the controller to the worker pods
+- real Tinker credentials and provider setup
+- long-run stability on your specific account and spot market
 
-So the repo is structurally ready for the intended setup, but final operational confidence still comes from a real GPU run on target hardware.
+So the repo is structurally ready for unattended Tinker + RunPod operation, but the final production proof is still a real run on your account.
 
 ## License
 

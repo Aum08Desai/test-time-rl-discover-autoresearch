@@ -1,6 +1,7 @@
-model_name: Qwen/Qwen3.5-35B-A3B
+model_name: openai/gpt-oss-120b
 provider: null
 api_base: null
+target_val_bpb: 0.85
 max_steps: 12
 groups_per_step: 2
 samples_per_step: 8
@@ -11,7 +12,7 @@ data_path: null
 baseline_command_override: null
 candidate_command_override: null
 experiment_name: autoresearch-ttt-discover
-renderer_name: null
+renderer_name: gpt_oss_high_reasoning
 learning_rate: 0.00004
 lora_rank: 32
 kl_penalty_coef: 0.1
@@ -22,5 +23,30 @@ num_cpus_per_task: 0
 eval_timeout: 2700
 local_model_path: null
 keep_history: 6
-max_concurrent_evaluations: 1
+max_concurrent_evaluations: 16
 gpu_devices: null
+execution_backend: runpod
+runpod_api_key_env: RUNPOD_API_KEY
+runpod_api_base: https://rest.runpod.io/v1
+runpod_cloud_type: COMMUNITY
+runpod_interruptible: true
+runpod_gpu_type_ids:
+  - NVIDIA H100 PCIe
+runpod_template_id: null
+runpod_image_name: runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
+runpod_name_prefix: autoresearch-ttt
+runpod_support_public_ip: true
+runpod_ports:
+  - 22/tcp
+runpod_container_disk_gb: 50
+runpod_volume_gb: 0
+runpod_volume_mount_path: /workspace
+runpod_ssh_user: root
+runpod_ssh_private_key_path: null
+runpod_repo_root: /workspace/autoresearch
+runpod_prepare_num_shards: 10
+runpod_bootstrap_timeout_sec: 7200
+runpod_retry_limit: 3
+runpod_poll_interval_sec: 5
+runpod_bootstrap_commands: null
+runpod_terminate_on_close: true

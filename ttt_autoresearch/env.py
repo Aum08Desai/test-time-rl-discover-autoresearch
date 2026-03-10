@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 import asyncio
 import json
@@ -8,23 +7,9 @@ from typing import Any, ClassVar
 
 from ttt_autoresearch.config import BootstrapContext
 from ttt_autoresearch.discover_compat import Environment, State, VerifyResult
+from ttt_autoresearch.prompt_builder import build_rollout_prompt
 from ttt_autoresearch.reward import AutoResearchRewardEvaluator
 from ttt_autoresearch.runner import parse_patch_candidate
-
-
-def read_recent_history(history_path: Path, limit: int) -> list[dict[str, Any]]:
-    if not history_path.exists():
-        return []
-    entries: list[dict[str, Any]] = []
-    for line in history_path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            entries.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return entries[-limit:]
-
 
 class AutoResearchState(State):
     def __init__(
@@ -39,9 +24,6 @@ class AutoResearchState(State):
         observation: str = "",
         baseline_val_bpb: float | None = None,
         current_best_val_bpb: float | None = None,
-        history: list[dict[str, Any]] | None = None,
-        summary: str = "",
-        rationale: str = "",
         raw_score: float | None = None,
     ) -> None:
         super().__init__(
@@ -56,9 +38,6 @@ class AutoResearchState(State):
         )
         self.baseline_val_bpb = baseline_val_bpb
         self.current_best_val_bpb = current_best_val_bpb
-        self.history = history or []
-        self.summary = summary
-        self.rationale = rationale
         self.raw_score = raw_score
 
     @property
@@ -69,6 +48,45 @@ class AutoResearchState(State):
     def current_train_py(self) -> str:
         return self.code
 
+    def to_prompt(self, target: float, metric_name: str = "value", maximize: bool = True, language: str = "") -> str:
+        value_ctx = f"You are iteratively optimizing {metric_name}."
+        improvement_direction = "higher" if maximize else "lower"
+
+        has_code = self.code and self.code.strip()
+        if has_code:
+            value_ctx += "\nHere is the last code we ran:\n"
+            if language:
+                value_ctx += f"```{language}\n{self.code}\n```"
+            else:
+                value_ctx += self.code
+        else:
+            value_ctx += "\nNo previous code available."
+
+        if self.parent_values and self.value is not None:
+            before_value = self.parent_values[0] if maximize else -self.parent_values[0]
+            after_value = self.value if maximize else -self.value
+            current_gap = target - after_value if maximize else after_value - target
+            value_ctx += (
+                f"\nHere is the {metric_name} before and after running the code above ({improvement_direction} is better): "
+                f"{before_value:.6f} -> {after_value:.6f}"
+            )
+            value_ctx += f"\nTarget: {target}. Current gap: {current_gap:.6f}. Further improvements will also be generously rewarded."
+        elif self.value is not None:
+            after_value = self.value if maximize else -self.value
+            current_gap = target - after_value if maximize else after_value - target
+            value_ctx += f"\nCurrent {metric_name} ({improvement_direction} is better): {after_value:.6f}"
+            value_ctx += f"\nTarget: {target}. Current gap: {current_gap:.6f}. Further improvements will also be generously rewarded."
+        else:
+            value_ctx += f"\nTarget {metric_name}: {target}"
+
+        if self.observation and self.observation.strip():
+            stdout = self.observation.strip()
+            if len(stdout) > 500:
+                stdout = "\n\n\t\t ...(TRUNCATED)...\n" + stdout[-500:]
+            value_ctx += f"\n\n--- Previous Program Output ---\n{stdout}\n--- End Output ---"
+
+        return value_ctx
+
     def to_dict(self) -> dict[str, Any]:
         payload = super().to_dict()
         payload.update(
@@ -76,9 +94,6 @@ class AutoResearchState(State):
                 "type": self.__class__.__name__,
                 "baseline_val_bpb": self.baseline_val_bpb,
                 "current_best_val_bpb": self.current_best_val_bpb,
-                "history": self.history,
-                "summary": self.summary,
-                "rationale": self.rationale,
                 "raw_score": self.raw_score,
             }
         )
@@ -97,9 +112,6 @@ class AutoResearchState(State):
             observation=data.get("observation", ""),
             baseline_val_bpb=data.get("baseline_val_bpb"),
             current_best_val_bpb=data.get("current_best_val_bpb"),
-            history=data.get("history"),
-            summary=data.get("summary", ""),
-            rationale=data.get("rationale", ""),
             raw_score=data.get("raw_score"),
         )
 
@@ -145,9 +157,6 @@ class AutoResearchDiscoverEnv(Environment):
             observation=baseline_stdout,
             baseline_val_bpb=cls.bootstrap.baseline_val_bpb,
             current_best_val_bpb=current_best,
-            history=[],
-            summary="baseline",
-            rationale="seed state from the original autoresearch train.py",
             raw_score=current_best,
         )
 
@@ -165,45 +174,24 @@ class AutoResearchDiscoverEnv(Environment):
             raise RuntimeError("AutoResearchDiscoverEnv is not configured.")
 
         state = self.initial_state
-        history = read_recent_history(self.bootstrap.history_path, self.bootstrap.config.keep_history)
-        if history:
-            history_text = "\n".join(
-                f"- [{entry['status']}] reward={entry['reward']:.6f} val_bpb={entry.get('val_bpb')} summary={entry['summary']}"
-                for entry in history
-            )
-        else:
-            history_text = "- No prior candidate evaluations yet."
-
-        return f"""{self.bootstrap.program_text}
-
-You are the outer autoresearch agent. Your only job is to improve train.py.
-You may edit train.py only. Do not modify prepare.py, program.md, or any other file.
-The reward comes from running train.py and measuring val_bpb. Lower val_bpb is better.
-
-Current best val_bpb: {state.current_best_val_bpb:.6f}
-Baseline val_bpb: {state.baseline_val_bpb:.6f}
-
-Current best train.py:
-```python
-{state.current_train_py}
-```
-
-Recent accepted and rejected edits:
-{history_text}
-
-Return exactly one ```json``` block with this schema:
-{{
-  "summary": "short description of the change",
-  "rationale": "why this should improve val_bpb",
-  "train_py": "the full replacement contents of train.py"
-}}
-
-Rules:
-- train_py must be the full file, not a diff.
-- Only edit train.py.
-- Keep the file runnable as a standalone script.
-- Optimize for the lowest val_bpb under the existing time budget.
-"""
+        target = self.bootstrap.config.target_val_bpb
+        if target is None:
+            target = state.current_best_val_bpb
+        state_ctx = state.to_prompt(target, metric_name="val_bpb", maximize=False, language="python")
+        return build_rollout_prompt(
+            state_ctx=state_ctx,
+            construction_section=(
+                "You may want to start your search from the current training script shown above.\n"
+                "This is the current starting point selected by the search procedure.\n"
+                "You are encouraged to explore meaningfully different directions if the current approach appears saturated."
+            ),
+            code_section=(
+                "Reason about how you could further improve this training script under the fixed 5-minute training budget.\n"
+                "Try different algorithmic ideas, architecture changes, optimizer and schedule changes, batching changes, or other training heuristics.\n"
+                "Moderate increases in VRAM are acceptable if they lead to meaningful gains.\n"
+                "Unless you make a meaningful improvement in `val_bpb`, you will not be rewarded."
+            ),
+        )
 
     def check_format(self, parsed_code: str) -> bool:
         try:
@@ -215,7 +203,7 @@ Rules:
     async def check_answer(self, parsed_code: str, step: int) -> VerifyResult:
         if not self.check_format(parsed_code):
             return VerifyResult(
-                reward=-1.0,
+                reward=0.0,
                 msg="Invalid candidate JSON.",
                 correctness=0.0,
                 raw_score=float(self.initial_state.current_best_val_bpb),
@@ -238,16 +226,6 @@ Rules:
 
     def _create_next_state(self, step_idx: int, parsed_code: str, outs: VerifyResult) -> AutoResearchState:
         candidate = parse_patch_candidate(parsed_code)
-        history_entry = {
-            "step": step_idx,
-            "summary": candidate.summary,
-            "rationale": candidate.rationale,
-            "reward": outs.reward,
-            "val_bpb": outs.raw_score,
-            "status": outs.metrics.get("candidate_status", "unknown"),
-        }
-        prior_history = list(getattr(self.initial_state, "history", []))
-        next_history = (prior_history + [history_entry])[-10:]
         parent_best = self.initial_state.current_best_val_bpb
         new_best = min(parent_best, outs.raw_score) if outs.raw_score is not None else parent_best
         return AutoResearchState(
@@ -258,9 +236,6 @@ Rules:
             observation=outs.stdout,
             baseline_val_bpb=self.initial_state.baseline_val_bpb,
             current_best_val_bpb=new_best,
-            history=next_history,
-            summary=candidate.summary,
-            rationale=candidate.rationale,
             raw_score=outs.raw_score,
         )
 

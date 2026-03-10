@@ -22,9 +22,10 @@ SUPPORTED_RENDERERS = (
 
 @dataclass(slots=True)
 class TTTAutoResearchConfig:
-    model_name: str = "Qwen/Qwen3.5-35B-A3B"
+    model_name: str = "openai/gpt-oss-120b"
     provider: str | None = None
     api_base: str | None = None
+    target_val_bpb: float | None = 0.85
     max_steps: int = 12
     groups_per_step: int = 2
     samples_per_step: int = 8
@@ -46,16 +47,43 @@ class TTTAutoResearchConfig:
     eval_timeout: int | None = None
     local_model_path: str | None = None
     keep_history: int = 6
-    max_concurrent_evaluations: int = 1
+    max_concurrent_evaluations: int = 16
     gpu_devices: list[str] | None = None
+    execution_backend: str = "runpod"
+    runpod_api_key_env: str = "RUNPOD_API_KEY"
+    runpod_api_base: str = "https://rest.runpod.io/v1"
+    runpod_cloud_type: str = "COMMUNITY"
+    runpod_interruptible: bool = True
+    runpod_gpu_type_ids: list[str] | None = None
+    runpod_template_id: str | None = None
+    runpod_image_name: str | None = "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
+    runpod_name_prefix: str = "autoresearch-ttt"
+    runpod_support_public_ip: bool = True
+    runpod_ports: list[str] | None = None
+    runpod_container_disk_gb: int = 50
+    runpod_volume_gb: int = 0
+    runpod_volume_mount_path: str = "/workspace"
+    runpod_ssh_user: str = "root"
+    runpod_ssh_private_key_path: str | None = None
+    runpod_repo_root: str = "/workspace/autoresearch"
+    runpod_prepare_num_shards: int = 10
+    runpod_bootstrap_timeout_sec: int = 7200
+    runpod_retry_limit: int = 3
+    runpod_poll_interval_sec: int = 5
+    runpod_bootstrap_commands: list[str] | None = None
+    runpod_terminate_on_close: bool = True
 
     def normalized(self, repo_root: Path) -> "TTTAutoResearchConfig":
         run_dir = _resolve_path(self.run_dir, repo_root) if self.run_dir else repo_root / "runs" / datetime.now().strftime("%Y%m%d_%H%M%S")
         experiment_name = self.experiment_name or run_dir.name
+        execution_backend = self.execution_backend.lower()
+        if execution_backend not in {"local", "runpod"}:
+            raise ValueError("execution_backend must be either 'local' or 'runpod'.")
         return TTTAutoResearchConfig(
             model_name=self.model_name,
             provider=self.provider,
             api_base=self.api_base,
+            target_val_bpb=self.target_val_bpb,
             max_steps=self.max_steps,
             groups_per_step=max(1, int(self.groups_per_step)),
             samples_per_step=self.samples_per_step,
@@ -79,6 +107,29 @@ class TTTAutoResearchConfig:
             keep_history=self.keep_history,
             max_concurrent_evaluations=max(1, int(self.max_concurrent_evaluations)),
             gpu_devices=_normalize_string_list(self.gpu_devices),
+            execution_backend=execution_backend,
+            runpod_api_key_env=self.runpod_api_key_env,
+            runpod_api_base=self.runpod_api_base.rstrip("/"),
+            runpod_cloud_type=self.runpod_cloud_type.upper(),
+            runpod_interruptible=bool(self.runpod_interruptible),
+            runpod_gpu_type_ids=_normalize_string_list(self.runpod_gpu_type_ids) or ["NVIDIA H100 PCIe"],
+            runpod_template_id=self.runpod_template_id,
+            runpod_image_name=self.runpod_image_name,
+            runpod_name_prefix=self.runpod_name_prefix,
+            runpod_support_public_ip=bool(self.runpod_support_public_ip),
+            runpod_ports=_normalize_string_list(self.runpod_ports) or ["22/tcp"],
+            runpod_container_disk_gb=max(20, int(self.runpod_container_disk_gb)),
+            runpod_volume_gb=max(0, int(self.runpod_volume_gb)),
+            runpod_volume_mount_path=self.runpod_volume_mount_path,
+            runpod_ssh_user=self.runpod_ssh_user,
+            runpod_ssh_private_key_path=_resolve_optional_path_str(self.runpod_ssh_private_key_path, repo_root),
+            runpod_repo_root=self.runpod_repo_root.rstrip("/"),
+            runpod_prepare_num_shards=max(2, int(self.runpod_prepare_num_shards)),
+            runpod_bootstrap_timeout_sec=max(300, int(self.runpod_bootstrap_timeout_sec)),
+            runpod_retry_limit=max(1, int(self.runpod_retry_limit)),
+            runpod_poll_interval_sec=max(1, int(self.runpod_poll_interval_sec)),
+            runpod_bootstrap_commands=_normalize_command(self.runpod_bootstrap_commands),
+            runpod_terminate_on_close=bool(self.runpod_terminate_on_close),
         )
 
     def to_dict(self) -> dict[str, Any]:
