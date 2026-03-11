@@ -182,6 +182,34 @@ def patch_ttt_discover_kimi_tokenizer() -> None:
         dataset_builder.get_tokenizer = misc_utils.get_tokenizer
 
 
+def patch_ttt_discover_kimi_renderer() -> None:
+    """Register a Kimi-specific renderer alias that maps to the Qwen3 format.
+
+    Tinker exposes Kimi K2.5 as a reasoning model, but upstream discover only
+    knows about ``qwen3`` renderer names for this token format. Expose an
+    explicit ``kimi_k25`` renderer so the local config matches the model family
+    while preserving the same underlying rendering behavior.
+    """
+
+    try:
+        from ttt_discover.tinker_utils import renderers
+    except ImportError:
+        return
+
+    if getattr(renderers, "_autoresearch_kimi_renderer_patch", False):
+        return
+
+    original_get_renderer = renderers.get_renderer
+
+    def patched_get_renderer(name: str, tokenizer: Any):
+        if name == "kimi_k25":
+            return renderers.Qwen3Renderer(tokenizer)
+        return original_get_renderer(name, tokenizer)
+
+    renderers.get_renderer = patched_get_renderer
+    renderers._autoresearch_kimi_renderer_patch = True
+
+
 def patch_transformers_kimi_trust_remote_code() -> None:
     """Force trust_remote_code=True for Kimi K2.5 tokenizer loads.
 

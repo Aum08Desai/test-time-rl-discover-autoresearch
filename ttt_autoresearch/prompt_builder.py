@@ -6,16 +6,18 @@ from typing import Any
 CONSTRUCTION_SECTION = (
     "You may want to start your search from the current training script shown above.\n"
     "This is the current starting point selected by the search procedure.\n"
-    "Make one focused experimental change at a time and preserve a working script.\n"
+    "Preserve a working script, but do not limit yourself to tiny hyperparameter tweaks.\n"
+    "Pursue bold, high-upside changes when they are technically coherent and likely to materially improve val_bpb.\n"
     "You are encouraged to explore meaningfully different directions if the current approach appears saturated."
 )
 
 CODE_SECTION = (
     "Reason about how you could further improve this training script under the fixed 5-minute training budget.\n"
-    "Prefer small, local hill-climbing edits over broad rewrites.\n"
+    "Hyperparameter tuning is allowed, but do not stop there: pursue stronger algorithmic, architectural, data-flow, attention, optimization, or systems ideas when they could deliver a step-change improvement.\n"
+    "Prefer edits that are technically coherent and high-upside, even if they are more ambitious than simple hill-climbing.\n"
     "Try different algorithmic ideas, architecture changes, optimizer and schedule changes, batching changes, or other training heuristics.\n"
     "Moderate increases in VRAM are acceptable if they lead to meaningful gains.\n"
-    "Do not refactor unrelated code.\n"
+    "Do not refactor unrelated code, but do make all integration edits required for the new idea to work cleanly.\n"
     "Unless you make a meaningful improvement in `val_bpb`, you will not be rewarded."
 )
 
@@ -45,7 +47,7 @@ Everything in `train.py` is fair game:
 **Lower `val_bpb` values are better** - they indicate a stronger model under the fixed evaluation budget.
 
 ## Budget & Resources
-- **Time budget**: 5 minutes of wall-clock training time
+- **Time budget**: 5 minutes of wall-clock training time on a single NVIDIA H100 GPU
 - **Evaluation harness**: fixed AutoResearch runner
 - **VRAM**: moderate increases are acceptable for meaningful gains, but avoid wasteful blowups
 
@@ -82,7 +84,7 @@ Everything in `train.py` is fair game:
 - The SEARCH text must match the current starting `train.py` exactly
 - Propose exactly one candidate for this rollout
 - Optimize for the lowest `val_bpb` under the fixed time budget
-- Prefer simpler changes when improvement is similar
+- Prefer simpler changes when improvement is similar (large changes such as architectural or similar changes are preferred when improvement is large)
 
 ## Example Response
 <<<<<<< SEARCH

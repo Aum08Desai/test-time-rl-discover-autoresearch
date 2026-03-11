@@ -233,7 +233,7 @@ class RunnerTests(unittest.TestCase):
             model_name="moonshotai/Kimi-K2.5",
             execution_backend="local",
         ).normalized(Path("."))
-        self.assertEqual(config.renderer_name, "qwen3")
+        self.assertEqual(config.renderer_name, "kimi_k25")
 
     def test_group_defaults_reflect_medium_preset(self) -> None:
         config = TTTAutoResearchConfig().normalized(Path("."))

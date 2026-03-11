@@ -1,4 +1,4 @@
-model_name: moonshotai/Kimi-K2.5
+model_name: openai/gpt-oss-120b
 provider: null
 api_base: null
 target_val_bpb: 0.85
@@ -12,7 +12,7 @@ data_path: null
 baseline_command_override: null
 candidate_command_override: null
 experiment_name: autoresearch-ttt-discover
-renderer_name: qwen3
+renderer_name: gpt_oss_high_reasoning
 learning_rate: 0.00004
 lora_rank: 32
 kl_penalty_coef: 0.1

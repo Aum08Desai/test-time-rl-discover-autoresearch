@@ -18,6 +18,7 @@ AGENTS.md
 
 # Experimental code/artifacts
 dev/
+testing/output/
 # Results file
 results.tsv
 runs/

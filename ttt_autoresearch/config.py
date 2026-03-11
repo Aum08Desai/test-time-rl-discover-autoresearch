@@ -11,6 +11,7 @@ from typing import Any
 
 DISCOVER_GIT_REV = "5df1a0ee9b04272ca33de0101ae64dd499e63f29"
 SUPPORTED_RENDERERS = (
+    "kimi_k25",
     "qwen3",
     "qwen3_instruct",
     "gpt_oss_no_sysprompt",
@@ -218,7 +219,7 @@ class BootstrapContext:
 def infer_renderer_name(model_name: str) -> str | None:
     lowered = model_name.lower()
     if "kimi-k2" in lowered or "moonshotai/kimi" in lowered:
-        return "qwen3"
+        return "kimi_k25"
     if "qwen" in lowered:
         if "instruct" in lowered:
             return "qwen3_instruct"

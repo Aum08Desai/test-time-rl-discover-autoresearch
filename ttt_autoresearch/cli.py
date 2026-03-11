@@ -9,6 +9,7 @@ import sys
 
 from ttt_autoresearch.config import TTTAutoResearchConfig, load_config, write_resolved_config
 from ttt_autoresearch.discover_compat import (
+    patch_ttt_discover_kimi_renderer,
     patch_transformers_kimi_trust_remote_code,
     patch_ttt_discover_kimi_tokenizer,
     patch_ttt_discover_no_wandb_bug,
@@ -71,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
 
     patch_ttt_discover_no_wandb_bug()
     patch_ttt_discover_kimi_tokenizer()
+    patch_ttt_discover_kimi_renderer()
 
     runner = AutoResearchRunner(repo_root=repo_root, config=config, run_dir=run_dir)
     try:
