@@ -119,7 +119,12 @@ def main(argv: list[str] | None = None) -> int:
             num_substeps=1,
             save_every=config.save_every,
             load_checkpoint_path=None,
-            remove_constant_reward_groups=True,
+            # Keep all rollout groups so each outer step always trains on the full
+            # configured batch (e.g. 2 groups x 8 rollouts = 16 total rollouts).
+            # Upstream discover's constant-reward-group filtering can collapse a
+            # step to a single 8-rollout group when rewards are uniform, which is
+            # not what we want for this environment.
+            remove_constant_reward_groups=False,
             phase1_max_tokens=config.phase1_max_tokens,
             local_model_path=config.local_model_path,
         )

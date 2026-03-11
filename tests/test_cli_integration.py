@@ -173,7 +173,7 @@ class CliIntegrationTests(unittest.TestCase):
                 self.assertEqual(captured["rl_config"]["adv_estimator"], "entropic_adaptive_beta")
                 self.assertEqual(captured["rl_config"]["loss_fn"], "importance_sampling")
                 self.assertEqual(captured["rl_config"]["num_substeps"], 1)
-                self.assertTrue(captured["rl_config"]["remove_constant_reward_groups"])
+                self.assertFalse(captured["rl_config"]["remove_constant_reward_groups"])
                 self.assertEqual(captured["dataset_config"]["batch_size"], 3)
                 self.assertEqual(captured["dataset_config"]["group_size"], 2)
                 self.assertEqual(captured["dataset_config"]["problem_type"], "autoresearch")

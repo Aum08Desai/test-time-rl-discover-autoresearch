@@ -67,11 +67,14 @@ class EnvSmokeTests(unittest.TestCase):
             AutoResearchRewardEvaluator.configure(bootstrap, runner)
 
             state = AutoResearchDiscoverEnv.create_initial_state("autoresearch")
-            env = AutoResearchDiscoverEnv(renderer=None, initial_state=state, sampler=None, config=type("Cfg", (), {
+            sampler = type("Sampler", (), {"step": 0})()
+            env = AutoResearchDiscoverEnv(renderer=None, initial_state=state, sampler=sampler, config=type("Cfg", (), {
                 "problem_type": "autoresearch",
                 "log_path": str(bootstrap.discover_log_dir),
                 "eval_timeout": config.eval_timeout,
+                "timeout": config.eval_timeout,
                 "num_cpus_per_task": 0,
+                "convo_prefix": [],
             })())
 
             prompt = env.get_question()
